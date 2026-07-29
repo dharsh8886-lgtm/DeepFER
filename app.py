@@ -1,15 +1,21 @@
 from pathlib import Path
 import threading
-import time
 
+import av
 import cv2
 import numpy as np
 import streamlit as st
 import tensorflow as tf
 from PIL import Image
+from streamlit_webrtc import (
+    RTCConfiguration,
+    VideoProcessorBase,
+    WebRtcMode,
+    webrtc_streamer,
+)
 
 # --------------------------------------------------
-# Page configuration
+# Page setup
 # --------------------------------------------------
 
 st.set_page_config(
@@ -26,8 +32,15 @@ st.markdown(
         padding-top: 2rem;
     }
 
-    img {
+    video {
+        width: 100% !important;
         border-radius: 12px;
+    }
+
+    video::-webkit-media-controls,
+    video::-webkit-media-controls-enclosure,
+    video::-webkit-media-controls-panel {
+        display: none !important;
     }
     </style>
     """,
@@ -35,7 +48,7 @@ st.markdown(
 )
 
 # --------------------------------------------------
-# Paths and class names
+# Paths and labels
 # --------------------------------------------------
 
 MODEL_PATH = Path("models/deepfer_model.keras")
@@ -51,9 +64,6 @@ DEFAULT_CLASS_NAMES = [
     "surprise",
 ]
 
-# --------------------------------------------------
-# Load resources
-# --------------------------------------------------
 
 def load_class_names():
     if CLASS_NAMES_PATH.exists():
@@ -64,7 +74,6 @@ def load_class_names():
             ).splitlines()
             if line.strip()
         ]
-
         if names:
             return names
 
@@ -72,10 +81,10 @@ def load_class_names():
 
 
 @st.cache_resource
-def load_emotion_model():
+def load_model():
     if not MODEL_PATH.exists():
         raise FileNotFoundError(
-            f"Model file was not found: {MODEL_PATH}"
+            f"Model file not found: {MODEL_PATH}"
         )
 
     return tf.keras.models.load_model(
@@ -95,19 +104,19 @@ def load_face_detector():
 
     if detector.empty():
         raise RuntimeError(
-            "The Haar Cascade face detector could not be loaded."
+            "Haar Cascade face detector could not be loaded."
         )
 
     return detector
 
 
 try:
-    MODEL = load_emotion_model()
+    MODEL = load_model()
     FACE_DETECTOR = load_face_detector()
     CLASS_NAMES = load_class_names()
 
 except Exception as error:
-    st.error(f"Unable to start the application: {error}")
+    st.error(f"Unable to start DeepFER: {error}")
     st.stop()
 
 
@@ -145,27 +154,33 @@ def predict_emotion(face_gray):
 
 
 def detect_faces(gray_image, for_live=False):
-    processed_gray = cv2.equalizeHist(gray_image)
+    equalized = cv2.equalizeHist(gray_image)
 
     faces = FACE_DETECTOR.detectMultiScale(
-        processed_gray,
-        scaleFactor=1.05,
-        minNeighbors=3,
-        minSize=(50, 50) if for_live else (30, 30),
+        equalized,
+        scaleFactor=1.1,
+        minNeighbors=4,
+        minSize=(55, 55) if for_live else (30, 30),
     )
 
-    return processed_gray, faces
+    return equalized, faces
 
 
-def draw_predictions(image_bgr, for_live=False):
-    gray_image = cv2.cvtColor(
+def process_uploaded_image(image):
+    image_rgb = np.array(image.convert("RGB"))
+    image_bgr = cv2.cvtColor(
+        image_rgb,
+        cv2.COLOR_RGB2BGR,
+    )
+
+    gray = cv2.cvtColor(
         image_bgr,
         cv2.COLOR_BGR2GRAY,
     )
 
     processed_gray, faces = detect_faces(
-        gray_image,
-        for_live=for_live,
+        gray,
+        for_live=False,
     )
 
     results = []
@@ -210,23 +225,118 @@ def draw_predictions(image_bgr, for_live=False):
             cv2.LINE_AA,
         )
 
-    if for_live and len(faces) == 0:
-        cv2.putText(
-            image_bgr,
-            "No face detected",
-            (20, 40),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (0, 0, 255),
-            2,
-            cv2.LINE_AA,
-        )
-
-    return image_bgr, results
+    return (
+        cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB),
+        results,
+    )
 
 
 # --------------------------------------------------
-# Interface
+# Browser live-camera processor
+# --------------------------------------------------
+
+class EmotionVideoProcessor(VideoProcessorBase):
+    def __init__(self):
+        self.frame_count = 0
+        self.last_box = None
+        self.last_emotion = "Detecting..."
+        self.last_confidence = 0.0
+
+    def recv(self, frame):
+        image = frame.to_ndarray(format="bgr24")
+        image = cv2.flip(image, 1)
+
+        self.frame_count += 1
+
+        # Detect the face every second frame.
+        should_detect = self.frame_count % 2 == 0
+
+        if should_detect:
+            gray = cv2.cvtColor(
+                image,
+                cv2.COLOR_BGR2GRAY,
+            )
+
+            processed_gray, faces = detect_faces(
+                gray,
+                for_live=True,
+            )
+
+            if len(faces) > 0:
+                self.last_box = max(
+                    faces,
+                    key=lambda box: box[2] * box[3],
+                )
+
+                x, y, width, height = self.last_box
+                face = processed_gray[
+                    y:y + height,
+                    x:x + width
+                ]
+
+                # Predict every sixth frame to reduce cloud lag.
+                if self.frame_count % 6 == 0 and face.size > 0:
+                    try:
+                        (
+                            self.last_emotion,
+                            self.last_confidence,
+                            _,
+                        ) = predict_emotion(face)
+
+                    except Exception:
+                        self.last_emotion = "Error"
+                        self.last_confidence = 0.0
+
+            else:
+                self.last_box = None
+
+        if self.last_box is not None:
+            x, y, width, height = self.last_box
+
+            label = (
+                f"{self.last_emotion.capitalize()} "
+                f"{self.last_confidence:.1f}%"
+            )
+
+            cv2.rectangle(
+                image,
+                (x, y),
+                (x + width, y + height),
+                (0, 255, 0),
+                2,
+            )
+
+            cv2.putText(
+                image,
+                label,
+                (x, max(y - 10, 30)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.75,
+                (0, 255, 0),
+                2,
+                cv2.LINE_AA,
+            )
+
+        else:
+            cv2.putText(
+                image,
+                "No face detected",
+                (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.75,
+                (0, 0, 255),
+                2,
+                cv2.LINE_AA,
+            )
+
+        return av.VideoFrame.from_ndarray(
+            image,
+            format="bgr24",
+        )
+
+
+# --------------------------------------------------
+# UI
 # --------------------------------------------------
 
 st.title("😊 DeepFER")
@@ -237,13 +347,9 @@ st.subheader(
 upload_tab, live_tab = st.tabs(
     [
         "📤 Upload Image",
-        "📷 Local Live Camera",
+        "📷 Live Camera",
     ]
 )
-
-# --------------------------------------------------
-# Upload image
-# --------------------------------------------------
 
 with upload_tab:
     st.write(
@@ -267,36 +373,19 @@ with upload_tab:
         if st.button(
             "Detect Emotion",
             type="primary",
-            key="detect-upload",
         ):
-            image_rgb = np.array(
-                uploaded_image.convert("RGB")
-            )
-
-            image_bgr = cv2.cvtColor(
-                image_rgb,
-                cv2.COLOR_RGB2BGR,
-            )
-
-            processed_bgr, results = draw_predictions(
-                image_bgr,
-                for_live=False,
-            )
-
-            processed_rgb = cv2.cvtColor(
-                processed_bgr,
-                cv2.COLOR_BGR2RGB,
+            processed_image, results = process_uploaded_image(
+                uploaded_image
             )
 
             if not results:
                 st.warning(
-                    "No face was detected. Upload a clearer image "
-                    "with the full face visible and facing forward."
+                    "No face was detected. Upload a clearer image."
                 )
 
             else:
                 st.image(
-                    processed_rgb,
+                    processed_image,
                     caption="Emotion detection result",
                     use_container_width=True,
                 )
@@ -311,162 +400,80 @@ with upload_tab:
                         f"({result['confidence']:.1f}%)"
                     )
 
-                    prediction_values = {
-                        class_name.capitalize(): float(score)
-                        for class_name, score in zip(
+                    chart_data = {
+                        name.capitalize(): float(score)
+                        for name, score in zip(
                             CLASS_NAMES,
                             result["predictions"],
                         )
                     }
 
-                    st.bar_chart(prediction_values)
+                    st.bar_chart(chart_data)
 
-
-# --------------------------------------------------
-# Local OpenCV live camera
-# --------------------------------------------------
-# --------------------------------------------------
-# Local OpenCV live camera
-# --------------------------------------------------
 
 with live_tab:
+    st.write(
+        "Click **START**, allow camera permission, and face "
+        "the camera directly."
+    )
+
     st.info(
-        "This camera mode works on the computer running Streamlit."
+        "This uses the visitor's browser camera and works on "
+        "Streamlit Cloud."
     )
 
-    start_camera = st.button(
-        "Start Local Camera",
-        type="primary",
-        key="start-local-camera",
+    rtc_configuration = RTCConfiguration(
+        {
+            "iceServers": [
+                {
+                    "urls": [
+                        "stun:stun.l.google.com:19302",
+                        "stun:stun1.l.google.com:19302",
+                    ]
+                }
+            ]
+        }
     )
 
-    frame_placeholder = st.empty()
-    status_placeholder = st.empty()
+    try:
+        webrtc_streamer(
+            key="deepfer-browser-camera",
+            mode=WebRtcMode.SENDRECV,
+            video_processor_factory=EmotionVideoProcessor,
+            rtc_configuration=rtc_configuration,
+            media_stream_constraints={
+                "video": {
+                    "width": {
+                        "ideal": 320,
+                        "max": 480,
+                    },
+                    "height": {
+                        "ideal": 240,
+                        "max": 360,
+                    },
+                    "frameRate": {
+                        "ideal": 12,
+                        "max": 15,
+                    },
+                    "facingMode": "user",
+                },
+                "audio": False,
+            },
+            video_html_attrs={
+                "autoPlay": True,
+                "controls": False,
+                "muted": True,
+                "playsInline": True,
+            },
+            async_processing=False,
+        )
 
-    if start_camera:
-        camera = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-
-        camera.set(cv2.CAP_PROP_FRAME_WIDTH, 480)
-        camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
-        camera.set(cv2.CAP_PROP_FPS, 15)
-        camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-        if not camera.isOpened():
-            st.error(
-                "The webcam could not be opened. Close other apps "
-                "using the camera, then try again."
-            )
-
-        else:
-            status_placeholder.success(
-                "Camera started. Refresh the page to stop it."
-            )
-
-            frame_count = 0
-            last_emotion = "Detecting..."
-            last_confidence = 0.0
-
-            try:
-                while camera.isOpened():
-                    success, frame = camera.read()
-
-                    if not success:
-                        st.warning("A camera frame could not be read.")
-                        break
-
-                    frame = cv2.flip(frame, 1)
-
-                    gray_image = cv2.cvtColor(
-                        frame,
-                        cv2.COLOR_BGR2GRAY,
-                    )
-
-                    processed_gray, faces = detect_faces(
-                        gray_image,
-                        for_live=True,
-                    )
-
-                    frame_count += 1
-
-                    # Predict less often, but draw the face box on every frame.
-                    should_predict = frame_count % 5 == 0
-
-                    if len(faces) > 0:
-                        # Use the largest detected face.
-                        x, y, width, height = max(
-                            faces,
-                            key=lambda box: box[2] * box[3],
-                        )
-
-                        face = processed_gray[
-                            y:y + height,
-                            x:x + width
-                        ]
-
-                        if should_predict and face.size > 0:
-                            try:
-                                (
-                                    last_emotion,
-                                    last_confidence,
-                                    _,
-                                ) = predict_emotion(face)
-
-                            except Exception:
-                                last_emotion = "Error"
-                                last_confidence = 0.0
-
-                        label = (
-                            f"{last_emotion.capitalize()} "
-                            f"{last_confidence:.1f}%"
-                        )
-
-                        cv2.rectangle(
-                            frame,
-                            (x, y),
-                            (x + width, y + height),
-                            (0, 255, 0),
-                            2,
-                        )
-
-                        cv2.putText(
-                            frame,
-                            label,
-                            (x, max(y - 10, 30)),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.75,
-                            (0, 255, 0),
-                            2,
-                            cv2.LINE_AA,
-                        )
-
-                    else:
-                        cv2.putText(
-                            frame,
-                            "No face detected",
-                            (20, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.8,
-                            (0, 0, 255),
-                            2,
-                            cv2.LINE_AA,
-                        )
-
-                    frame_rgb = cv2.cvtColor(
-                        frame,
-                        cv2.COLOR_BGR2RGB,
-                    )
-
-                    frame_placeholder.image(
-                        frame_rgb,
-                        channels="RGB",
-                        use_container_width=True,
-                    )
-
-                    time.sleep(0.02)
-
-            finally:
-                camera.release()
-                status_placeholder.info("Camera stopped.")
+    except Exception as error:
+        st.warning(
+            "The live camera did not start. Refresh the page, "
+            "allow camera permission, and press START again."
+        )
+        st.caption(f"Camera details: {error}")
 
 
 st.caption(
