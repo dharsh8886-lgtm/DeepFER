@@ -1,9 +1,7 @@
-streamlit
-tensorflow
-numpy
-opencv-python-headless
-Pillow
-av
-streamlit-webrtc
-scikit-learn
-matplotlib
+streamlit==1.41.1
+tensorflow-cpu==2.18.0
+numpy==1.26.4
+opencv-python-headless==4.10.0.84
+Pillow==11.1.0
+streamlit-webrtc==0.47.9
+av==12.3.0
